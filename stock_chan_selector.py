@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-A股股票：月线多头 + 周线回踩条件 + DeepSeek 分析
+A股股票：月线 MA5/MA10 金叉 + 斜率加速 + DeepSeek 分析
 
-选股条件：
-1) 月线多头：最新月线收盘价同时大于 5/10/20 月均线（不要求均线多头排列）；
-2) 周线条件：最近 3 个交易日中，至少有一天收盘价同时大于 5 周线、10 周线，
-   但小于 20 周线；
-3) 综合打分后取前 10 只，调用 DeepSeek（flash 版）做结构化分析。
+选股条件（全部为月线级别）：
+1) 最新一根月线 MA5 > MA10；
+2) 前 5 根月线中，至少有一根 MA5 < MA10（最近 5 个月内出现金叉）；
+3) 最近 3 根月线，MA5 的斜率大于 MA10 的斜率；
+4) 综合打分后取前 10 只，调用 DeepSeek（flash 版）做结构化分析。
 
-说明：月线量能不再作为硬性条件，仅在结果和 DeepSeek 提示词中作为参考指标。
+说明：该结构用于捕捉“月线刚从底部启动”；量能不再作为硬性条件，仅作参考。
 数据源：Tushare Pro（stock_basic / daily / adj_factor / trade_cal）
-复用 etf_chan_selector.py 中的月线、周线、量能计算函数。
+复用 etf_chan_selector.py 中的月线、量能计算函数。
 用法：
     python3 stock_chan_selector.py
     python3 stock_chan_selector.py --skip-ds
@@ -124,16 +124,10 @@ def prefilter_by_monthly_ma(api: base.Api, universe: pd.DataFrame, latest: str,
 
     keep = []
     for code, row in px.iterrows():
-        arr = row.dropna().values.astype(float)
-        if len(arr) < 20:
-            continue
-        last = arr[-1]
-        if not np.isfinite(last) or last <= 0:
-            continue
-        if last > arr[-5:].mean() and last > arr[-10:].mean() and last > arr[-20:].mean():
+        if base.monthly_cross_signal(row.values) is not None:
             keep.append(code)
 
-    log(f"  月线均线预筛通过：{len(keep)} 只")
+    log(f"  月线 MA5/MA10 金叉预筛通过：{len(keep)} 只")
     res = universe[universe["ts_code"].isin(keep)].copy()
     if last_snapshot is not None:
         res = res.merge(
@@ -204,11 +198,18 @@ def evaluate_stock(api: base.Api, row: dict, start_date: str, latest: str,
         return None
 
     close = float(monthly["close"].iloc[-1])
-    ma5 = float(monthly["close"].iloc[-5:].mean())
-    ma10 = float(monthly["close"].iloc[-10:].mean())
-    ma20 = float(monthly["close"].iloc[-20:].mean())
-    if not (close > ma5 and close > ma10 and close > ma20):
+    sig = base.monthly_cross_signal(monthly["close"].values)
+    if sig is None:
         return None
+
+    ma5 = sig["ma5"]
+    ma10 = sig["ma10"]
+    ma20 = float(monthly["close"].iloc[-20:].mean())
+    gap = sig["gap"]
+    cross_age = sig["cross_age"]
+    slope5 = sig["slope5"]
+    slope10 = sig["slope10"]
+    accel = sig["accel"]
 
     rally_i = base.find_rally_start(monthly)
     if rally_i is None:
@@ -226,34 +227,36 @@ def evaluate_stock(api: base.Api, row: dict, start_date: str, latest: str,
             "score": 0.0,
         }
 
-    wp = base.weekly_pullback(daily)
-    if wp is None or not wp["passed"]:
-        return None
-
     rally_low = float(monthly["low"].iloc[rally_i])
     rally_months = len(monthly) - rally_i
     rally_ret = close / rally_low - 1.0
+    low12 = float(monthly["low"].tail(12).min())
+    rally_ret12 = close / low12 - 1.0
 
     dev20 = close / ma20 - 1.0
-    dev10 = close / ma10 - 1.0
-    dev5 = close / ma5 - 1.0
 
     def clip01(x):
         return float(min(1.0, max(0.0, x)))
 
-    trend_score = (
-        0.60 * clip01(dev20 / 0.20)
-        + 0.25 * clip01(dev10 / 0.10)
-        + 0.15 * clip01(dev5 / 0.05)
-    )
+    # 越接近启动越好：金叉越新、开口适中、加速度越大、离 MA20 和主底部越近
+    cross_score = clip01((6.0 - cross_age) / 5.0)
+    gap_score = float(np.tanh(gap / 0.03))
+    accel_score = float(np.tanh(accel / (abs(slope10) + 0.02)))
+    position_score = clip01(1.0 - dev20 / 0.25)
+    bottom_score = clip01(1.0 - rally_ret / 1.0)
 
     amt20 = float(daily["amount"].tail(20).mean())
     amt_yi = amt20 / 1e5
-    if amt_yi < base.MIN_AVG_AMOUNT_YI:
-        return None
     liq_score = clip01(amt_yi / 2.0)
 
-    total = 70.0 * trend_score + 30.0 * liq_score
+    total = 100.0 * (
+        0.25 * cross_score
+        + 0.20 * gap_score
+        + 0.20 * accel_score
+        + 0.20 * position_score
+        + 0.10 * bottom_score
+        + 0.05 * liq_score
+    )
     pct = float(daily["pct_chg"].iloc[-1]) if "pct_chg" in daily.columns else np.nan
 
     return {
@@ -269,29 +272,29 @@ def evaluate_stock(api: base.Api, row: dict, start_date: str, latest: str,
         "monthly_ma5": ma5,
         "monthly_ma10": ma10,
         "monthly_ma20": ma20,
+        "ma5_ma10_gap": gap,
+        "cross_age": cross_age,
+        "ma5_slope": slope5,
+        "ma10_slope": slope10,
+        "slope_accel": accel,
         "close_vs_ma20": dev20,
         "rally_start": monthly.index[rally_i].strftime("%Y-%m-%d"),
         "rally_months": rally_months,
+        "rally_low": rally_low,
         "rally_return": rally_ret,
+        "low_12m": low12,
+        "rally_return_12m": rally_ret12,
         "vol_slope_pct": vt["slope_pct"],
         "vol_r2": vt["r2"],
         "vol_recent_early": vt["recent_early_ratio"],
         "vol_max_median": vt["max_median_ratio"],
         "vol_months": vt["months"],
-        "weekly_hit_days": wp["hit_days"],
-        "weekly_checked_days": wp["checked_days"],
-        "weekly_hit_date": wp["hit_date"],
-        "weekly_hit_close": wp["hit_close"],
-        "weekly_hit_ma5": wp["hit_ma5"],
-        "weekly_hit_ma10": wp["hit_ma10"],
-        "weekly_hit_ma20": wp["hit_ma20"],
-        "weekly_cur_date": wp["cur_date"],
-        "weekly_cur_close": wp["cur_close"],
-        "weekly_cur_ma5": wp["cur_ma5"],
-        "weekly_cur_ma10": wp["cur_ma10"],
-        "weekly_cur_ma20": wp["cur_ma20"],
         "avg_amount_20d_yi": amt_yi,
-        "trend_score": trend_score,
+        "gap_score": gap_score,
+        "cross_score": cross_score,
+        "accel_score": accel_score,
+        "position_score": position_score,
+        "bottom_score": bottom_score,
         "liquidity_score": liq_score,
         "score": total,
     }
@@ -303,17 +306,17 @@ def evaluate_stock(api: base.Api, row: dict, start_date: str, latest: str,
 def build_prompt(top: pd.DataFrame, latest: str) -> str:
     lines = []
     lines.append(
-        "你是一位同时精通 A 股股票投资与技术分析（月线/周线级别）的资深分析师。"
-        "下面是基于 Tushare 行情、按月线多头 + 周线回踩条件"
+        "你是一位同时精通 A 股股票投资与技术分析的资深分析师。"
+        "下面是基于 Tushare 行情、按“月线 MA5/MA10 金叉 + 斜率加速”"
         f"筛选出的 A 股股票前 {len(top)} 名。数据截止交易日：{latest}。\n"
     )
-    lines.append("选股条件：")
-    lines.append("1) 月线多头：最新月线收盘价同时高于 5/10/20 月均线（不要求均线多头排列）；")
-    lines.append("2) 周线条件：最近 3 个交易日中，至少一天收盘价同时高于 5 周线、10 周线，"
-                 "但低于 20 周线；")
-    lines.append("3) 全部为 A 股股票，T+1 交易；涨跌幅限制按板块不同："
-                 "主板 10%，创业板/科创板 20%，北交所 30%。")
-    lines.append("说明：月线量能不是筛选条件，下面的量能数据仅作参考。\n")
+    lines.append("选股条件（全部为月线级别）：")
+    lines.append("1) 最新一根月线 MA5 > MA10；")
+    lines.append("2) 前 5 根月线中，至少有一根 MA5 < MA10（即最近 5 个月内出现金叉）；")
+    lines.append("3) 最近 3 根月线，MA5 的斜率大于 MA10 的斜率；")
+    lines.append("4) 全部为 A 股股票，T+1 交易；涨跌幅限制：主板 10%，"
+                 "创业板/科创板 20%，北交所 30%。")
+    lines.append("说明：这三条用于捕捉“月线刚从底部启动”的结构；量能仅作参考。\n")
     lines.append("候选明细（价格均为前复权）：")
 
     for i, r in top.iterrows():
@@ -329,37 +332,37 @@ def build_prompt(top: pd.DataFrame, latest: str) -> str:
             f"\n[{i + 1}] {r['name']}（{r['ts_code']}，{r['industry']}，{r['market']}）\n"
             f"  - 最新价：{r['close']:.3f}，当日涨跌：{r['pct_chg']:.2f}%\n"
             f"  - 月线 MA5/10/20：{r['monthly_ma5']:.3f} / {r['monthly_ma10']:.3f} / "
-            f"{r['monthly_ma20']:.3f}；收盘较 MA20 高 {r['close_vs_ma20'] * 100:.1f}%\n"
-            f"  - 月线波段：{r['rally_start']} 起涨，至今 {r['rally_months']} 个月，"
-            f"区间涨幅 {r['rally_return'] * 100:.1f}%\n"
+            f"{r['monthly_ma20']:.3f}；MA5 较 MA10 高 {r['ma5_ma10_gap'] * 100:.2f}%，"
+            f"收盘较 MA20 高 {r['close_vs_ma20'] * 100:.1f}%\n"
+            f"  - 金叉月龄：约 {r['cross_age']} 个月前 MA5 上穿 MA10；"
+            f"最近3月 MA5 斜率 {r['ma5_slope']:.3f}/月，MA10 斜率 {r['ma10_slope']:.3f}/月，"
+            f"斜率差 {r['slope_accel']:.3f}\n"
+            f"  - 月线波段：{r['rally_start']} 起涨，低点 {r['rally_low']:.3f}，"
+            f"至今 {r['rally_months']} 个月，区间涨幅 {r['rally_return'] * 100:.1f}%\n"
+            f"  - 12个月低点：{r['low_12m']:.3f}，当前较其高 "
+            f"{r['rally_return_12m'] * 100:.1f}%\n"
             f"  - {vol_line}\n"
-            f"  - 周线条件：最近 {r['weekly_checked_days']} 个交易日中有 "
-            f"{r['weekly_hit_days']} 天命中“收盘>5周线且>10周线且<20周线”；\n"
-            f"    命中日 {r['weekly_hit_date']}：收盘 {r['weekly_hit_close']:.3f}，"
-            f"周线 MA5/10/20 = {r['weekly_hit_ma5']:.3f} / {r['weekly_hit_ma10']:.3f} / "
-            f"{r['weekly_hit_ma20']:.3f}\n"
-            f"    最新 {r['weekly_cur_date']}：收盘 {r['weekly_cur_close']:.3f}，"
-            f"周线 MA5/10/20 = {r['weekly_cur_ma5']:.3f} / {r['weekly_cur_ma10']:.3f} / "
-            f"{r['weekly_cur_ma20']:.3f}\n"
             f"  - 近20日日均成交额：{r['avg_amount_20d_yi']:.2f} 亿元；"
             f"量化综合分：{r['score']:.1f}/100"
         )
 
     lines.append(
         "\n请用中文输出一份结构化分析报告，要求：\n"
-        "1. 【总体结论】先用 150 字概括这批股票的月线趋势与周线回踩结构的整体特征；\n"
+        "1. 【总体结论】先用 150 字概括这批股票的月线金叉与斜率加速特征；\n"
         "2. 【逐只分析】按下面维度逐只分析（每只 120~180 字）：\n"
-        "   (a) 月线级别趋势是否健康，属于“启动初期 / 主升中段 / 高位加速”哪一段；"
-        "量能仅作参考，若明显缩量需提示量价背离风险；\n"
-        "   (b) 周线条件的技术含义：股价站上 5/10 周线但仍低于 20 周线，"
-        "判断这是健康的周线级别回踩修复，还是弱势反弹；结合股价与 20 周线的距离评估突破难度；\n"
-        "   (c) 关键观察位：周线 MA5、MA10、MA20 的具体价格，"
-        "以及重新站上 20 周线 / 跌破 10 周线分别意味着什么；\n"
-        "   (d) 所属行业与板块属性对走势的影响，以及 10%/20%/30% 涨跌幅限制对交易节奏的影响；\n"
+        "   (a) 月线金叉的有效性：MA5/MA10 交叉时间、当前开口大小，"
+        "结合距 12 个月低点的涨幅，判断是“刚从底部启动”还是已经走了一段；\n"
+        "   (b) 斜率加速：最近 3 个月 MA5 与 MA10 的斜率差，"
+        "判断处于加速初期、加速中段还是过热阶段；\n"
+        "   (c) 关键观察位：月线 MA5、MA10、MA20 的具体价格，"
+        "以及最近月线波段低点；跌破 MA10 / MA20 分别意味着什么；\n"
+        "   (d) 所属行业与板块属性，以及 10%/20%/30% 涨跌幅限制对交易节奏的影响；\n"
+        "   (e) 风险：金叉失败、斜率走平、乖离过大；量能仅作参考，"
+        "若明显缩量需提示量价背离；\n"
         f"3. 【优先级排序】给出 1~{len(top)} 名的排序表，并说明前 3 名入选理由"
-        "（可参考量化分，但要结合月线与周线结构修正）；\n"
+        "（可参考量化分，但要结合月线结构修正）；\n"
         "4. 【操作与风控】分别给出“偏进攻 / 偏稳健”两种配置思路，说明关注区间、"
-        "失效条件（如跌破周线 MA10 或 20 周线迟迟不能收复）与仓位建议；\n"
+        "失效条件（如跌破月线 MA10 或 MA5 重新下穿 MA10）与仓位建议；\n"
         f"5. 【风险提示】指出这 {len(top)} 只中结构最弱、最需要回避的 1~2 只及原因；"
         "并声明本文仅为技术研究，不构成投资建议。\n"
         "注意：不要编造数据，所有价格引用必须来自上面的明细。"
@@ -371,7 +374,7 @@ def build_prompt(top: pd.DataFrame, latest: str) -> str:
 # 六、主流程
 # ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="A股股票月线+周线选股")
+    parser = argparse.ArgumentParser(description="A股股票月线 MA5/MA10 金叉选股")
     parser.add_argument("--outdir", default="/workspace/output_stock")
     parser.add_argument("--lookback-months", type=int, default=36)
     parser.add_argument("--daily-years", type=float, default=5.0)
@@ -403,7 +406,7 @@ def main():
     latest = detect_latest_trade_date(api)
     log(f"数据最新交易日：{latest}")
 
-    # 3) 月线均线预筛
+    # 3) 月线 MA5/MA10 金叉预筛
     candidates = prefilter_by_monthly_ma(
         api, universe, latest, lookback_months=args.lookback_months
     )
@@ -452,8 +455,8 @@ def main():
 
     if not results:
         log(
-            f"本次 0 只：月线均线预筛 {len(candidates)} 只，最终没有股票同时满足"
-            f"“月线多头 + 最近3个交易日周线条件”。"
+            f"本次 0 只：月线金叉预筛 {len(candidates)} 只，最终没有股票同时满足"
+            f"“MA5>MA10 + 近5月内出现过MA5<MA10 + 近3月MA5斜率>MA10斜率”。"
         )
         log("这是有效的筛选结果，不调用 DeepSeek；已写入空的 stock_selection_all.csv。")
         pd.DataFrame().to_csv(
@@ -476,8 +479,8 @@ def main():
     for r in top.itertuples():
         log(
             f"  {r.rank:>2}. {r.name}({r.ts_code}) {r.industry} "
-            f"score={r.score:.1f} 周线命中={r.weekly_hit_days}/{r.weekly_checked_days}天 "
-            f"量斜率={r.vol_slope_pct * 100:.1f}%/月"
+            f"score={r.score:.1f} 金叉月龄={r.cross_age} "
+            f"MA5/MA10={r.monthly_ma5:.3f}/{r.monthly_ma10:.3f}"
         )
 
     # 5) DeepSeek
@@ -493,14 +496,14 @@ def main():
     log(f"调用 DeepSeek 分析前 {len(top)} 只股票 ...")
     content, model = base.call_deepseek(
         prompt,
-        system_prompt="你是严谨的 A 股股票与缠论技术分析师，只基于给定数据推理，不编造数据。",
+        system_prompt="你是严谨的 A 股股票技术分析师，只基于给定数据推理，不编造数据。",
     )
     md_path = os.path.join(args.outdir, "deepseek_stock_analysis.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# A股股票 DeepSeek 分析（模型：{model}）\n\n")
         f.write(f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"- 数据截止：{latest}\n")
-        f.write(f"- 选股条件：月线多头 + 最近3日周线回踩条件（量能仅参考）\n\n")
+        f.write(f"- 选股条件：月线 MA5/MA10 金叉 + 近3月斜率加速（量能仅参考）\n\n")
         f.write("---\n\n")
         f.write(content)
     log(f"DeepSeek 分析已保存：{md_path}")
